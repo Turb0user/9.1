@@ -1,556 +1,402 @@
-Да. Здесь уже видно несколько конкретных проблем. Радио само по себе, судя по предыдущему тесту, работает. Зависание появляется именно после IRQ приёма, на цепочке readData() → codec2_decode() → FIFO → StartRX().
+Да. В этом варианте причина зависания на приёме, скорее всего, не радио. У тебя уже был рабочий приём на тех же пинах и с теми же параметрами FSK. После добавления Codec2 + аудиотаймера появляется участок, который может надолго блокировать loop().
 
-Самая подозрительная часть — сейчас у тебя одновременно работают:
+Главное подозрение — codec2_decode() выполняется прямо в обработчике приёма, пока TIM3 продолжает работать на 8 кГц, плюс одновременно меняется FIFO. Для диагностики сначала надо разделить радио и Codec2.
 
-TIM3 ISR 8000 Гц;
-DIO1 IRQ радио;
-codec2_decode() из loop();
-Serial.print() из loop();
-прямое управление ADC;
-прямое управление TIM1.
-
-И есть одна особенно неприятная ошибка в обработке радио.
-
-1. Сначала убираем возможное зависание внутри readData()
-
-Сейчас:
-
+1. Сначала замени весь блок RX на этот
 if (radioActionFlag) {
     radioActionFlag = false;
 
     if (!isTransmittingMode) {
-        uint8_t rawBuffer[PACKET_LENGTH];
-        int state = radio.readData(rawBuffer, PACKET_LENGTH);
 
-        if (state == RADIOLIB_ERR_NONE) {
-            ...
-        }
-
-        StartRX_Async();
-    }
-}
-
-Сделай диагностику до и после каждого этапа:
-
-if (radioActionFlag) {
-
-    radioActionFlag = false;
-
-    if (!isTransmittingMode) {
-
-        Serial.print("[IRQ]");
+        Serial.println(F("[RX-1] IRQ"));
 
         uint8_t rawBuffer[PACKET_LENGTH];
 
-        Serial.print("[RD]");
+        Serial.println(F("[RX-2] readData..."));
+
         int state = radio.readData(rawBuffer, PACKET_LENGTH);
-        Serial.print("[RD=");
-        Serial.print(state);
-        Serial.print("]");
+
+        Serial.print(F("[RX-3] readData state="));
+        Serial.println(state);
 
         if (state == RADIOLIB_ERR_NONE) {
 
-            stat_rx_packet_cnt++;
+            Serial.println(F("[RX-4] PACKET OK"));
 
-            Serial.print("[OK]");
+            Serial.print(F("[RX-DATA] "));
+            for (int i = 0; i < PACKET_LENGTH; i++) {
+                if (rawBuffer[i] < 0x10) Serial.print('0');
+                Serial.print(rawBuffer[i], HEX);
+                Serial.print(' ');
+            }
+            Serial.println();
 
-            if (c2 != NULL) {
+            Serial.println(F("[RX-5] before codec"));
 
-                int16_t pcm_out_buffer[CODEC2_SAMPLES_PER_FRM];
+            int16_t pcm_out_buffer[CODEC2_SAMPLES_PER_FRM];
 
-                Serial.print("[DEC]");
+            for (int f = 0; f < 2; f++) {
 
-                for (int f = 0; f < 2; f++) {
+                Serial.print(F("[RX-DEC] frame "));
+                Serial.println(f);
 
-                    codec2_decode(
-                        c2,
-                        pcm_out_buffer,
-                        rawBuffer + f * CODEC2_FRAME_BYTES
-                    );
+                codec2_decode(
+                    c2,
+                    pcm_out_buffer,
+                    rawBuffer + f * CODEC2_FRAME_BYTES
+                );
 
-                    Serial.print(".");
+                Serial.println(F("[RX-DEC] decoded"));
 
-                    for (int i = 0; i < CODEC2_SAMPLES_PER_FRM; i++) {
-                        audioOut_put(pcm_out_buffer[i]);
-                    }
+                for (int i = 0; i < CODEC2_SAMPLES_PER_FRM; i++) {
+                    audioOut_put(pcm_out_buffer[i]);
                 }
 
-                Serial.print("[DECOK]");
+                Serial.println(F("[RX-DEC] FIFO done"));
             }
+
+            Serial.println(F("[RX-6] codec complete"));
         }
 
-        Serial.print("[RX]");
+        Serial.println(F("[RX-7] restart RX"));
 
         StartRX_Async();
 
-        Serial.print("[RXOK]");
+        Serial.println(F("[RX-8] RX restarted"));
     }
     else {
         txReadyForNext = true;
     }
 }
 
-Особенно важно, где остановится вывод.
+Это сразу покажет, где именно зависает.
 
-Например:
+2. Но я вижу ещё одну серьёзную проблему
 
-[IRQ][RD]
+У тебя сейчас:
 
-значит проблема в radio.readData().
+MyTim = new HardwareTimer(TIM3);
+MyTim->setOverflow(8000, HERTZ_FORMAT);
+MyTim->attachInterrupt(Timer_8kHz_ISR);
+MyTim->setInterruptPriority(4, 0);
+MyTim->resume();
 
-[IRQ][RD=0][OK][DEC].
+И одновременно:
 
-значит зависание происходит внутри первого codec2_decode().
+codec2_decode(...)
 
-[IRQ][RD=0][OK][DEC]..[DECOK][RX]
+Codec2 выполняет довольно тяжёлую обработку. А каждые 125 мкс его прерывает:
 
-значит проблема в StartRX_Async().
+Timer_8kHz_ISR()
 
-2. Но я вижу более серьёзную проблему с таймером
+В ISR выполняется:
 
-У тебя ISR:
+audioOut_get(pcm_out);
 
-void Timer_8kHz_ISR(void) {
+и запись:
 
-    int16_t pcm_out = 0;
+TIM1->CCR1 = pwm_val;
 
-    if (audioOut_get(pcm_out)) {
-        ...
-        TIM1->CCR1 = pwm_val;
-    } else {
-        TIM1->CCR1 = 128;
-        stat_underrun_flag = true;
+Само по себе это нормально, но для диагностики Codec2 обязательно отключим TIM3 на время декодирования.
+
+Сделай так:
+
+Перед декодированием:
+
+MyTim->pause();
+
+После декодирования:
+
+MyTim->resume();
+
+То есть:
+
+if (state == RADIOLIB_ERR_NONE) {
+
+    Serial.println(F("[RX-4] PACKET OK"));
+
+    int16_t pcm_out_buffer[CODEC2_SAMPLES_PER_FRM];
+
+    // Останавливаем аудио ISR
+    MyTim->pause();
+
+    Serial.println(F("[RX-5] codec start"));
+
+    for (int f = 0; f < 2; f++) {
+
+        Serial.print(F("[RX-DEC] frame "));
+        Serial.println(f);
+
+        codec2_decode(
+            c2,
+            pcm_out_buffer,
+            rawBuffer + f * CODEC2_FRAME_BYTES
+        );
+
+        Serial.println(F("[RX-DEC] decoded"));
+
+        for (int i = 0; i < CODEC2_SAMPLES_PER_FRM; i++) {
+            audioOut_put(pcm_out_buffer[i]);
+        }
+
+        Serial.println(F("[RX-DEC] FIFO done"));
     }
 
-    if (isTransmittingMode) {
-        ...
-        audioIn_put(tone_pcm);
-        sineIdx++;
-        ADC1->CR2 |= ADC_CR2_SWSTART;
+    Serial.println(F("[RX-6] codec complete"));
+
+    // Возвращаем аудиотаймер
+    MyTim->resume();
+}
+
+Но есть важный нюанс: если остановить TIM3, FIFO перестаёт выдаваться в PWM. После resume() он начнёт воспроизводиться.
+
+3. Ещё лучше — вообще не декодировать два кадра одним вызовом RX
+
+Сейчас у тебя:
+
+IRQ
+ ↓
+readData
+ ↓
+codec2_decode frame 0
+ ↓
+codec2_decode frame 1
+ ↓
+640 samples → FIFO
+ ↓
+startReceive
+
+Это потенциально длинный блок.
+
+Я бы сделал очередь:
+
+RADIO IRQ
+   ↓
+readData
+   ↓
+копируем 14 байт
+   ↓
+сразу startReceive()
+   ↓
+loop()
+   ↓
+Codec2 decode
+   ↓
+FIFO
+
+То есть радио должно как можно быстрее вернуться в RX.
+
+4. Самое важное исправление
+
+Добавь отдельный буфер пакета:
+
+volatile bool codecPacketReady = false;
+uint8_t codecPacket[PACKET_LENGTH];
+
+И RX:
+
+if (radioActionFlag) {
+    radioActionFlag = false;
+
+    if (!isTransmittingMode) {
+
+        Serial.println(F("[RX-1] IRQ"));
+
+        int state = radio.readData(codecPacket, PACKET_LENGTH);
+
+        Serial.print(F("[RX-2] state="));
+        Serial.println(state);
+
+        if (state == RADIOLIB_ERR_NONE) {
+            stat_rx_packet_cnt++;
+            codecPacketReady = true;
+
+            Serial.println(F("[RX-3] packet copied"));
+        }
+
+        Serial.println(F("[RX-4] restart"));
+
+        StartRX_Async();
+
+        Serial.println(F("[RX-5] RX ready"));
+    }
+    else {
+        txReadyForNext = true;
     }
 }
 
-То есть во время приёма ADC вообще не нужен, но PWM ISR всё равно работает постоянно.
+А Codec2 вынести ниже, отдельно:
 
-Это само по себе допустимо, но сейчас ISR обращается к FIFO в то время, когда основной поток выполняет:
+if (codecPacketReady && !isTransmittingMode) {
+
+    codecPacketReady = false;
+
+    Serial.println(F("[CODEC] START"));
+
+    int16_t pcm_out_buffer[CODEC2_SAMPLES_PER_FRM];
+
+    MyTim->pause();
+
+    for (int f = 0; f < 2; f++) {
+
+        Serial.print(F("[CODEC] frame="));
+        Serial.println(f);
+
+        codec2_decode(
+            c2,
+            pcm_out_buffer,
+            codecPacket + f * CODEC2_FRAME_BYTES
+        );
+
+        Serial.println(F("[CODEC] decoded"));
+
+        for (int i = 0; i < CODEC2_SAMPLES_PER_FRM; i++) {
+            audioOut_put(pcm_out_buffer[i]);
+        }
+    }
+
+    MyTim->resume();
+
+    Serial.println(F("[CODEC] DONE"));
+}
+
+Это уже гораздо правильнее.
+
+5. Но есть ещё одна проблема с твоим FIFO
+
+Ты используешь:
+
+inline void audioOut_put(int16_t sample)
+
+а ISR одновременно делает:
+
+audioOut_get(...)
+
+На STM32F401 запись 32-битного head/tail атомарна, поэтому обычно это работает. Но во время массовой загрузки 640 сэмплов лучше временно запретить IRQ:
+
+for (int i = 0; i < CODEC2_SAMPLES_PER_FRM; i++) {
+    audioOut_put(pcm_out_buffer[i]);
+}
+
+не обязательно.
+
+Не надо делать __disable_irq() вокруг всего codec2_decode() — это уже может сломать радио.
+
+6. Очень важный тест
+
+Перед Codec2 вообще сделай такой RX:
+
+if (state == RADIOLIB_ERR_NONE) {
+
+    Serial.println(F("[RX] PACKET OK"));
+
+    for (int i = 0; i < PACKET_LENGTH; i++) {
+        Serial.print(rawBuffer[i], HEX);
+        Serial.print(' ');
+    }
+
+    Serial.println();
+}
+
+Без:
 
 codec2_decode()
 
-и:
+и без:
 
 audioOut_put()
 
-На STM32 это может работать, но я бы сейчас максимально упростил систему.
+Если при этом:
 
-3. На время диагностики полностью отключи ADC
+[RX-1] IRQ
+[RX-2] state=0
+[RX-3] packet copied
+[RX-4] restart
+[RX-5] RX ready
 
-Вот это:
+идёт стабильно — радио полностью исправно.
 
-ADC1->CR2 |= ADC_CR2_SWSTART;
+Тогда проблема точно находится в связке:
 
-вообще убери из ISR.
-
-И пока сделай ISR только таким:
-
-void Timer_8kHz_ISR(void) {
-
-    int16_t pcm_out;
-
-    if (audioOut_get(pcm_out)) {
-
-        int32_t pwm_val =
-            ((int32_t)pcm_out + 32768) >> 8;
-
-        if (pwm_val < 0)
-            pwm_val = 0;
-
-        if (pwm_val > 255)
-            pwm_val = 255;
-
-        TIM1->CCR1 = pwm_val;
-
-    } else {
-
-        TIM1->CCR1 = 128;
-        stat_underrun_flag = true;
-    }
-}
-
-Во время RX ADC нам вообще не нужен.
-
-4. Ещё одна проблема — audioOut_put() вызывается из основного потока
-
-Сейчас:
-
-inline void audioOut_put(int16_t sample) {
-
-    uint32_t next_tail =
-        (audioOutFIFO.tail + 1) & AUDIO_FIFO_MASK;
-
-    if (next_tail == audioOutFIFO.head) {
-        audioOutFIFO.head =
-            (audioOutFIFO.head + 1) & AUDIO_FIFO_MASK;
-    }
-
-    audioOutFIFO.buffer[audioOutFIFO.tail] = sample;
-    audioOutFIFO.tail = next_tail;
-}
-
-А audioOut_get() одновременно вызывается из ISR.
-
-Это SPSC FIFO, и в целом схема правильная, но во время диагностики я бы сделал ещё проще: декодируем кадр во временный буфер, затем одним критическим участком переносим данные.
-
-Например:
-
-for (int f = 0; f < 2; f++) {
-
-    codec2_decode(
-        c2,
-        pcm_out_buffer,
-        rawBuffer + f * CODEC2_FRAME_BYTES
-    );
-
-    noInterrupts();
-
-    for (int i = 0; i < CODEC2_SAMPLES_PER_FRM; i++) {
-        audioOut_put(pcm_out_buffer[i]);
-    }
-
-    interrupts();
-}
-
-Это не идеально с точки зрения realtime, но для диагностики позволит исключить гонку FIFO.
-
-5. Очень важный момент: твой AUDIO_FIFO_SIZE = 2048
-
-Для Codec2:
-
-320 samples / frame
-2 frames / packet
-640 samples / packet
-
-При 8000 Гц:
-
-640 / 8000 = 80 ms
-
-То есть один радиопакет даёт 80 мс звука.
-
-А FIFO:
-
-2048 / 8000 = 256 мс
-
-То есть примерно 256 мс буфера.
-
-Это нормально.
-
-6. Но у тебя codec2_decode() может выполняться дольше, чем кажется
-
-И при этом TIM3 продолжает генерировать:
-
-8000 interrupts/sec
-
-Причём каждое прерывание вызывает:
-
-audioOut_get()
-
-и ещё обращается к:
-
-TIM1->CCR1
-
-Если приоритет:
-
-MyTim->setInterruptPriority(4, 0);
-
-то это хорошо — он ниже радио.
-
-Но я бы вообще на время теста сделал:
-
-MyTim->setInterruptPriority(10, 0);
-
-или оставил стандартный низкий приоритет.
-
-7. Ещё одна очень важная вещь: не печатай диагностику слишком часто
+Codec2 + TIM3 + PWM/FIFO
+7. И ещё: у тебя сейчас неправильная логика PTT-фильтра
 
 Вот это:
-
-Serial.print(F("[I][R:OK]"));
-
-на каждом пакете при скорости 38.4 кбит/с — плохая идея.
-
-У тебя пакет 14 байт.
-
-Приблизительно один пакет может приходить каждые десятки миллисекунд, а Serial на 115200 тоже имеет конечную пропускную способность.
-
-Для теста вообще убери:
-
-Serial.print()
-
-из каждого пакета.
-
-Оставь только счётчики.
-
-Например:
-
-volatile uint32_t rxIrqCount = 0;
-volatile uint32_t rxOkCount = 0;
-volatile uint32_t rxErrCount = 0;
-
-IRQ:
-
-void Radio_IRQ_Handler() {
-    radioActionFlag = true;
-    rxIrqCount++;
-}
-
-Приём:
-
-if (state == RADIOLIB_ERR_NONE) {
-    rxOkCount++;
-}
-else {
-    rxErrCount++;
-}
-
-И раз в секунду:
-
-Serial.print("IRQ=");
-Serial.print(rxIrqCount);
-
-Serial.print(" OK=");
-Serial.print(rxOkCount);
-
-Serial.print(" ERR=");
-Serial.print(rxErrCount);
-
-Serial.print(" FIFO=");
-Serial.println(audioOut_available());
-8. Я бы сейчас вообще заменил весь RX-блок
-
-Вот этот:
-
-if (radioActionFlag) {
-    ...
-}
-
-на такой:
-
-if (radioActionFlag) {
-
-    radioActionFlag = false;
-
-    if (isTransmittingMode) {
-        txReadyForNext = true;
-    }
-    else {
-
-        uint8_t rawBuffer[PACKET_LENGTH];
-
-        int state = radio.readData(
-            rawBuffer,
-            PACKET_LENGTH
-        );
-
-        if (state == RADIOLIB_ERR_NONE) {
-
-            stat_rx_packet_cnt++;
-
-            if (c2 != NULL) {
-
-                int16_t pcm_out_buffer[CODEC2_SAMPLES_PER_FRM];
-
-                for (int f = 0; f < 2; f++) {
-
-                    codec2_decode(
-                        c2,
-                        pcm_out_buffer,
-                        rawBuffer +
-                        f * CODEC2_FRAME_BYTES
-                    );
-
-                    noInterrupts();
-
-                    for (int i = 0;
-                         i < CODEC2_SAMPLES_PER_FRM;
-                         i++) {
-
-                        audioOut_put(
-                            pcm_out_buffer[i]
-                        );
-                    }
-
-                    interrupts();
-                }
-            }
-        }
-
-        // ОБЯЗАТЕЛЬНО возвращаемся в RX
-        StartRX_Async();
-    }
-}
-9. И самое главное — исправить StartRX_Async()
-
-Сейчас:
-
-void StartRX_Async() {
-    digitalWrite(PIN_TXEN, LOW);
-    delayMicroseconds(10);
-    digitalWrite(PIN_RXEN, HIGH);
-    delayMicroseconds(10);
-    radio.startReceive();
-}
-
-Сделай:
-
-void StartRX_Async() {
-
-    digitalWrite(PIN_TXEN, LOW);
-    digitalWrite(PIN_RXEN, HIGH);
-
-    delayMicroseconds(100);
-
-    int state = radio.startReceive();
-
-    if (state != RADIOLIB_ERR_NONE) {
-        Serial.print("RX START ERROR=");
-        Serial.println(state);
-    }
-}
-
-Это важно: сейчас ты вообще не проверяешь результат startReceive().
-
-10. И TX тоже обязательно проверять
-
-Сейчас:
-
-radio.startTransmit(outPacket, PACKET_LENGTH);
-
-Лучше:
-
-int state = radio.startTransmit(
-    outPacket,
-    PACKET_LENGTH
-);
-
-if (state != RADIOLIB_ERR_NONE) {
-
-    Serial.print("TX START ERROR=");
-    Serial.println(state);
-
-    txReadyForNext = true;
-}
-11. Есть ещё ошибка в логике PTT
-
-У тебя:
-
-bool stablePttState = HIGH;
-
-а потом:
-
-bool currentRawPtt =
-    (digitalRead(PIN_PTT) == LOW);
-
-То есть currentRawPtt — это:
-
-true  = кнопка нажата
-false = кнопка отпущена
-
-а stablePttState первоначально:
-
-HIGH = true
-
-Получается после запуска программа считает PTT нажатым, пока debounce не установит правильное состояние.
-
-Правильно:
-
-bool stablePttState = false;
-
-И:
-
-uint32_t lastPttChangeTime = 0;
-12. И ещё одна критичная вещь с PTT
-
-У тебя:
 
 if (currentRawPtt != stablePttState) {
-
     if ((millis() - lastPttChangeTime) > 50) {
         stablePttState = currentRawPtt;
     }
-
 } else {
     lastPttChangeTime = millis();
 }
 
-Это работает не так, как обычно ожидается от debounce.
+не является нормальным debounce.
 
-Сделай нормально:
+Лучше:
 
 static bool lastRawPtt = false;
-static uint32_t pttTimer = 0;
 
-bool rawPtt =
-    (digitalRead(PIN_PTT) == LOW);
+bool rawPtt = (digitalRead(PIN_PTT) == LOW);
 
 if (rawPtt != lastRawPtt) {
+    lastPttChangeTime = millis();
     lastRawPtt = rawPtt;
-    pttTimer = millis();
 }
 
-if ((millis() - pttTimer) >= 50) {
-
-    if (stablePttState != rawPtt) {
-
-        stablePttState = rawPtt;
-
-        if (stablePttState) {
-
-            // PTT ON
-            __disable_irq();
-
-            audioInFIFO.head = 0;
-            audioInFIFO.tail = 0;
-
-            audioOutFIFO.head = 0;
-            audioOutFIFO.tail = 0;
-
-            __enable_irq();
-
-            isTransmittingMode = true;
-            txReadyForNext = true;
-
-            digitalWrite(PIN_LED, LOW);
-
-            SwitchToTX_Hardware();
-
-        } else {
-
-            // PTT OFF
-            isTransmittingMode = false;
-
-            digitalWrite(PIN_LED, HIGH);
-
-            StartRX_Async();
-        }
-    }
+if ((millis() - lastPttChangeTime) >= 50) {
+    stablePttState = rawPtt;
 }
-Что я считаю наиболее вероятным
 
-По твоему описанию я бы расставил подозрения так:
+Иначе при ВЧ/наводках у тебя реально могут происходить быстрые:
 
-№1 — взаимодействие codec2_decode() + 8 кГц ISR + FIFO.
+TX
+RX
+TX
+RX
+TX
+RX
 
-№2 — повторный startReceive() после IRQ при ещё неустоявшемся состоянии LLCC68.
+что видно в твоих предыдущих логах.
 
-№3 — Serial.print() на каждый пакет создаёт ощущение зависания/забивает обработку.
+Что я бы сделал сейчас
 
-№4 — неправильная работа PTT/debounce.
+Не менять радио вообще. Оно у тебя уже доказано рабочим.
 
-№5 — ADC стартует в каждом звуковом ISR, хотя на RX вообще не нужен.
+Сначала поставь архитектуру:
 
-И ещё: сам PWM пока не выглядит причиной зависания. Он может давать грязный звук, но он не должен намертво останавливать приём. Поэтому сейчас я бы не трогал TIM1, а сначала добился стабильного:
+                    ┌──────────────┐
+DIO1 ──IRQ─────────►│ readData()   │
+                    │ 14 bytes     │
+                    └──────┬───────┘
+                           │
+                           ▼
+                    codecPacket[14]
+                           │
+                    startReceive()
+                           │
+                           ▼
+                     радио снова RX
 
-IRQ → readData → codec2_decode → FIFO → startReceive
+loop()
+  │
+  └── codecPacketReady
+          │
+          ▼
+     codec2_decode()
+          │
+          ▼
+      640 samples
+          │
+          ▼
+       Audio FIFO
+          │
+          ▼
+       TIM3 8 kHz
+          │
+          ▼
+       TIM1 PWM PA8
 
-После этого отдельно будем чинить качество PWM-аудио.
+Главное: readData() должен завершиться → startReceive() → только потом заниматься Codec2.
 
-Если при твоём текущем коде вывод останавливается именно на [I][R:OK], это особенно важно: тогда радио пакет уже принято, и надо проверять именно codec2_decode()/FIFO, а не RF.
+И первым делом выведи лог именно с [RX-1] ... [RX-8]. По последней напечатанной строке я смогу точно сказать, зависает ли у тебя readData(), codec2_decode(), StartRX_Async() или аудиотаймер.
